@@ -417,7 +417,7 @@ static inline int64_t get_sector_offset(BlockDriverState *bs,
  *
  * Returns 0 on success and < 0 on error
  */
-static int rewrite_footer(BlockDriverState* bs)
+static int rewrite_footer(BlockDriverState *bs, bool update_header)
 {
     int ret;
     BDRVVPCState *s = bs->opaque;
@@ -426,6 +426,13 @@ static int rewrite_footer(BlockDriverState* bs)
     ret = bdrv_pwrite_sync(bs->file, offset, s->footer_buf, HEADER_SIZE);
     if (ret < 0)
         return ret;
+
+    if (update_header) {
+        ret = bdrv_pwrite_sync(bs->file, 0, s->footer_buf, HEADER_SIZE);
+        if (ret < 0) {
+            return ret;
+        }
+    }
 
     return 0;
 }
@@ -466,7 +473,7 @@ static int64_t alloc_block(BlockDriverState* bs, int64_t sector_num)
 
     // Write new footer (the old one will be overwritten)
     s->free_data_block_offset += s->block_size + s->bitmap_size;
-    ret = rewrite_footer(bs);
+    ret = rewrite_footer(bs, false);
     if (ret < 0)
         goto fail;
 
@@ -852,6 +859,180 @@ out:
     return ret;
 }
 
+
+static int vpc_truncate(BlockDriverState *bs, int64_t offset)
+{
+    BDRVVPCState *s = bs->opaque;
+    VHDFooter *footer = (VHDFooter *) s->footer_buf;
+    VHDDynDiskHeader *dyndisk_header;
+    void *buf = NULL;
+    int64_t new_total_sectors, old_bat_size, new_bat_size,
+            block_offset, new_block_offset, bat_offset;
+    int32_t bat_value, data_blocks_required;
+    int ret = 0;
+    uint16_t cyls = 0;
+    uint8_t heads = 0;
+    uint8_t secs_per_cyl = 0;
+    uint32_t new_num_bat_entries;
+    uint64_t index, block_index, new_bat_right_limit;
+
+    if (offset & 511) {
+        error_report("The new size must be a multiple of 512.");
+        return -EINVAL;
+    }
+
+    if (offset < bs->total_sectors * 512) {
+        error_report("Shrinking vhd images is not supported.");
+        return -ENOTSUP;
+    }
+
+    if (cpu_to_be32(footer->type) == VHD_DIFFERENCING) {
+        error_report("Resizing differencing vhd images is not supported.");
+        return -ENOTSUP;
+    }
+
+    old_bat_size = (s->max_table_entries * 4 + 511) & ~511;
+    new_total_sectors = offset / BDRV_SECTOR_SIZE;
+
+    for (index = 0; new_total_sectors > (int64_t)cyls * heads * secs_per_cyl;
+            index++) {
+        if (calculate_geometry(new_total_sectors + index, &cyls, &heads,
+                               &secs_per_cyl)) {
+            return -EFBIG;
+        }
+    }
+    new_total_sectors = (int64_t) cyls * heads * secs_per_cyl;
+    new_num_bat_entries = (new_total_sectors + s->block_size / 512) /
+                          (s->block_size / 512);
+
+    if (cpu_to_be32(footer->type) == VHD_DYNAMIC) {
+        new_bat_size = (new_num_bat_entries * 4 + 511) & ~511;
+        /* Number of blocks required for extending the BAT */
+        data_blocks_required = (new_bat_size - old_bat_size +
+                                s->block_size - 1) / s->block_size;
+        new_bat_right_limit = s->bat_offset + old_bat_size +
+                              data_blocks_required *
+                              (s->block_size + s->bitmap_size);
+
+        for (block_index = 0; block_index <
+                data_blocks_required; block_index++){
+            /*
+             * The BAT has to be extended. We'll have to move the first
+             * data block(s) to the end of the file, making room for the
+             * BAT to expand. Also, the BAT entries have to be updated for
+             * the moved blocks.
+             */
+
+            block_offset = s->bat_offset + old_bat_size +
+                           block_index * (s->block_size + s->bitmap_size);
+            if (block_offset >= s->free_data_block_offset) {
+                /*
+                * Do not allocate a new block for the BAT if no data blocks
+                * were previously allocated to the vhd image.
+                */
+                s->free_data_block_offset += (new_bat_size - old_bat_size);
+                break;
+            }
+
+            if (block_index == 0) {
+                buf = g_malloc(s->block_size + s->bitmap_size);
+            }
+
+            ret = bdrv_pread(bs->file, block_offset, buf,
+                             s->block_size + s->bitmap_size);
+            if (ret < 0) {
+                goto out;
+            }
+
+            new_block_offset = s->free_data_block_offset < new_bat_right_limit ?
+                           new_bat_right_limit : s->free_data_block_offset;
+            bdrv_pwrite_sync(bs->file, new_block_offset, buf,
+                             s->block_size + s->bitmap_size);
+            if (ret < 0) {
+                goto out;
+            }
+
+            for (index = 0; index < s->max_table_entries; index++) {
+                if (s->pagetable[index] == block_offset / BDRV_SECTOR_SIZE) {
+                    s->pagetable[index] = block_offset;
+                    bat_offset = s->bat_offset + (4 * index);
+                    bat_value = be32_to_cpu(new_block_offset /
+                                            BDRV_SECTOR_SIZE);
+                    ret = bdrv_pwrite_sync(bs->file, bat_offset, &bat_value, 4);
+                    if (ret < 0) {
+                        goto out;
+                    }
+                    break;
+                }
+            }
+
+            s->free_data_block_offset = new_block_offset + s->block_size +
+                                        s->bitmap_size;
+            g_free(buf);
+            buf = NULL;
+        }
+
+        buf = g_malloc(512);
+        memset(buf, 0xFF, 512);
+
+        /* Extend the BAT */
+        offset = s->bat_offset + old_bat_size;
+        for (index = 0;
+                index < (new_bat_size - old_bat_size) / 512;
+                index++) {
+            ret = bdrv_pwrite_sync(bs->file, offset, buf, 512);
+            if (ret < 0) {
+                goto out;
+            }
+            offset += 512;
+        }
+
+        g_free(buf);
+        buf = g_malloc(1024);
+
+        /* Update the Dynamic Disk Header */
+        ret = bdrv_pread(bs->file, 512, buf,
+                         1024);
+        if (ret < 0) {
+            goto out;
+        }
+
+        dyndisk_header = (VHDDynDiskHeader *) buf;
+        dyndisk_header->max_table_entries = be32_to_cpu(new_num_bat_entries);
+        dyndisk_header->checksum = 0;
+        dyndisk_header->checksum = be32_to_cpu(vpc_checksum(buf, 1024));
+        ret = bdrv_pwrite_sync(bs->file, 512, buf, 1024);
+        if (ret < 0) {
+            goto out;
+        }
+
+    } else {
+        s->free_data_block_offset = new_total_sectors * BDRV_SECTOR_SIZE;
+    }
+
+    footer->cyls = be16_to_cpu(cyls);
+    footer->heads = heads;
+    footer->secs_per_cyl = secs_per_cyl;
+    footer->size = be64_to_cpu(new_total_sectors * BDRV_SECTOR_SIZE);
+    footer->checksum = 0;
+    footer->checksum = be32_to_cpu(vpc_checksum(s->footer_buf, HEADER_SIZE));
+
+    /*
+     *  Rewrite the footer, copying to the image header in case of a
+     *  dynamic vhd.
+     */
+    rewrite_footer(bs, (cpu_to_be32(footer->type) != VHD_FIXED));
+    if (ret < 0) {
+        goto out;
+    }
+
+out:
+    if (buf) {
+        g_free(buf);
+    }
+    return ret;
+}
+
 static int vpc_has_zero_init(BlockDriverState *bs)
 {
     BDRVVPCState *s = bs->opaque;
@@ -916,6 +1097,7 @@ static BlockDriver bdrv_vpc = {
 
     .bdrv_get_info          = vpc_get_info,
 
+    .bdrv_truncate          = vpc_truncate,
     .create_opts            = &vpc_create_opts,
     .bdrv_has_zero_init     = vpc_has_zero_init,
 };
