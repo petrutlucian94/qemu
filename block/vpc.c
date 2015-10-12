@@ -745,7 +745,6 @@ static int vpc_create(const char *filename, QemuOpts *opts, Error **errp)
     uint8_t buf[1024];
     VHDFooter *footer = (VHDFooter *) buf;
     char *disk_type_param;
-    int i;
     uint16_t cyls = 0;
     uint8_t heads = 0;
     uint8_t secs_per_cyl = 0;
@@ -786,22 +785,13 @@ static int vpc_create(const char *filename, QemuOpts *opts, Error **errp)
     }
 
     /*
-     * Calculate matching total_size and geometry. Increase the number of
-     * sectors requested until we get enough (or fail). This ensures that
-     * qemu-img convert doesn't truncate images, but rather rounds up.
+     * Calculate matching total_size and geometry.
      */
     total_sectors = total_size / BDRV_SECTOR_SIZE;
-    for (i = 0; total_sectors > (int64_t)cyls * heads * secs_per_cyl; i++) {
-        if (calculate_geometry(total_sectors + i, &cyls, &heads,
-                               &secs_per_cyl))
-        {
-            ret = -EFBIG;
-            goto out;
-        }
+    if (calculate_geometry(total_sectors, &cyls, &heads, &secs_per_cyl)) {
+        ret = -EFBIG;
+        goto out;
     }
-
-    total_sectors = (int64_t) cyls * heads * secs_per_cyl;
-    total_size = total_sectors * BDRV_SECTOR_SIZE;
 
     /* Prepare the Hard Disk Footer */
     memset(buf, 0, 1024);
