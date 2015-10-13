@@ -750,7 +750,6 @@ static int vpc_create(const char *filename, QemuOpts *opts, Error **errp)
     uint8_t buf[1024];
     VHDFooter *footer = (VHDFooter *) buf;
     char *disk_type_param;
-    int i;
     uint16_t cyls = 0;
     uint8_t heads = 0;
     uint8_t secs_per_cyl = 0;
@@ -790,31 +789,20 @@ static int vpc_create(const char *filename, QemuOpts *opts, Error **errp)
         goto out;
     }
 
+    total_sectors = total_size / BDRV_SECTOR_SIZE;
+    if (total_sectors > VHD_MAX_SECTORS) {
+        /* Allow a maximum disk size of approximately 2 TB */
+        ret = -EFBIG;
+        goto out;
+    }
     /*
-     * Calculate matching total_size and geometry. Increase the number of
-     * sectors requested until we get enough (or fail). This ensures that
-     * qemu-img convert doesn't truncate images, but rather rounds up.
+     * Calculate geometry.
      *
      * If the image size can't be represented by a spec conform CHS geometry,
      * we set the geometry to 65535 x 16 x 255 (CxHxS) sectors and use
      * the image size from the VHD footer to calculate total_sectors.
      */
-    total_sectors = MIN(VHD_MAX_GEOMETRY, total_size / BDRV_SECTOR_SIZE);
-    for (i = 0; total_sectors > (int64_t)cyls * heads * secs_per_cyl; i++) {
-        calculate_geometry(total_sectors + i, &cyls, &heads, &secs_per_cyl);
-    }
-
-    if ((int64_t)cyls * heads * secs_per_cyl == VHD_MAX_GEOMETRY) {
-        total_sectors = total_size / BDRV_SECTOR_SIZE;
-        /* Allow a maximum disk size of approximately 2 TB */
-        if (total_sectors > VHD_MAX_SECTORS) {
-            ret = -EFBIG;
-            goto out;
-        }
-    } else {
-        total_sectors = (int64_t)cyls * heads * secs_per_cyl;
-        total_size = total_sectors * BDRV_SECTOR_SIZE;
-    }
+    calculate_geometry(total_sectors, &cyls, &heads, &secs_per_cyl);
 
     /* Prepare the Hard Disk Footer */
     memset(buf, 0, 1024);
