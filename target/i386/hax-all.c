@@ -36,6 +36,9 @@
 #include "qemu/main-loop.h"
 #include "hw/boards.h"
 
+#include "trace_cpu_exit.h"
+#include <windows.h>
+
 #define DEBUG_HAX 0
 
 #define DPRINTF(fmt, ...) \
@@ -360,8 +363,19 @@ static int hax_init(ram_addr_t ram_size)
     return ret;
 }
 
+static void hax_exit_notifier(Notifier *n, void *data) {
+    fprintf(stderr, "HAX exit notifier called.\n");
+    trace_cpu_print_stats();
+}
+
 static int hax_accel_init(MachineState *ms)
 {
+    Notifier *exit_notifier = g_malloc0(sizeof(Notifier));
+
+    trace_cpu_init(smp_cpus);
+    exit_notifier->notify = hax_exit_notifier;
+    qemu_add_exit_notifier(exit_notifier);
+
     int ret = hax_init(ms->ram_size);
 
     if (ret && (ret != -ENOSPC)) {
@@ -477,6 +491,10 @@ static int hax_vcpu_hax_exec(CPUArchState *env)
     struct hax_vcpu_state *vcpu = cpu->hax_vcpu;
     struct hax_tunnel *ht = vcpu->tunnel;
 
+    LONGLONG startTime, endTime, elapsedMicrosec;
+    LONGLONG counterFreq;
+    QueryPerformanceFrequency((LARGE_INTEGER*)&counterFreq);
+
     if (!hax_enabled()) {
         DPRINTF("Trying to vcpu execute at eip:" TARGET_FMT_lx "\n", env->eip);
         return 0;
@@ -530,6 +548,9 @@ static int hax_vcpu_hax_exec(CPUArchState *env)
             fprintf(stderr, "vcpu run failed for vcpu  %x\n", vcpu->vcpu_id);
             abort();
         }
+
+        QueryPerformanceCounter((LARGE_INTEGER*)&startTime);
+
         switch (ht->_exit_status) {
         case HAX_EXIT_IO:
             ret = hax_handle_io(env, ht->pio._df, ht->pio._port,
@@ -586,6 +607,35 @@ static int hax_vcpu_hax_exec(CPUArchState *env)
             ret = 1;
             break;
         }
+
+        QueryPerformanceCounter((LARGE_INTEGER*)&endTime);
+        elapsedMicrosec = endTime - startTime;
+        elapsedMicrosec *= 1000000;
+        elapsedMicrosec /= counterFreq;
+        trace_cpu_push_event(cpu->cpu_index, ht->_exit_status, elapsedMicrosec);
+
+        struct hax_fastmmio *hft;
+        switch (ht->_exit_status) {
+            case HAX_EXIT_FAST_MMIO:
+                hft = (struct hax_fastmmio *) vcpu->iobuf;
+                trace_mmio_event(cpu->cpu_index,
+                                 hft->gpa,
+                                 hft->size,
+                                 hft->direction,
+                                 elapsedMicrosec);
+                break;
+
+            case HAX_EXIT_IO:
+                trace_ioport_event(cpu->cpu_index,
+                                   ht->pio._port,
+                                   ht->pio._size,
+                                   ht->pio._direction,
+                                   elapsedMicrosec);
+                break;
+            default:
+                break;
+        }
+
     } while (!ret);
 
     if (cpu->exit_request) {
