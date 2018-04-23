@@ -3052,6 +3052,11 @@ int main(int argc, char **argv, char **envp)
     Error *err = NULL;
     bool list_data_dirs = false;
     char *dir, **dirs;
+    LONGLONG startTime, endTime, elapsedMicrosec;
+    LONGLONG counterFreq;
+    QueryPerformanceFrequency((LARGE_INTEGER*)&counterFreq);
+    QueryPerformanceCounter((LARGE_INTEGER*)&startTime);
+
     typedef struct BlockdevOptions_queue {
         BlockdevOptions *bdo;
         Location loc;
@@ -4732,6 +4737,14 @@ int main(int argc, char **argv, char **envp)
     os_setup_post();
 
     main_loop();
+
+    QueryPerformanceCounter((LARGE_INTEGER*)&endTime);
+    elapsedMicrosec = endTime - startTime;
+    elapsedMicrosec *= 1000000;
+    elapsedMicrosec /= counterFreq;
+
+    fprintf(stderr, "QEMU loop finished after %.6fs.\n",
+            elapsedMicrosec / 1000000.0);
 
     gdbserver_cleanup();
 

@@ -352,6 +352,8 @@ struct CPUState {
     int64_t icount_extra;
     sigjmp_buf jmp_env;
 
+    int last_access_size;
+
     QemuMutex work_mutex;
     struct qemu_work_item *queued_work_first, *queued_work_last;
 

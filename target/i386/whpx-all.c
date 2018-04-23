@@ -26,6 +26,9 @@
 #include "qapi/error.h"
 #include "migration/blocker.h"
 
+#include "trace_cpu_exit.h"
+#include <windows.h>
+
 #include <WinHvPlatform.h>
 #include <WinHvEmulation.h>
 
@@ -615,6 +618,63 @@ static const WHV_EMULATOR_CALLBACKS whpx_emu_callbacks = {
     .WHvEmulatorTranslateGvaPage = whpx_emu_translate_callback,
 };
 
+#define PRINT_OBJ(obj, fmt) \
+    fprintf(stderr, #obj ": " #fmt "\n", obj);
+
+static void log_memory_access(WHV_MEMORY_ACCESS_CONTEXT *ctx) {
+    fprintf(stderr, "WHV_MEMORY_ACCESS_CONTEXT\n");
+    fprintf(stderr, "=========================\n");
+
+    PRINT_OBJ(ctx->InstructionByteCount, %d)
+    int i;
+
+    fprintf(stderr, "ctx->InstructionBytes: ");
+    for (i=0; i<ctx->InstructionByteCount; i++)
+        fprintf(stderr, "%#02x ", ctx->InstructionBytes[i]);
+    fprintf(stderr, "\n");
+
+    PRINT_OBJ(ctx->AccessInfo.AccessType, %d)
+    PRINT_OBJ(ctx->AccessInfo.GpaUnmapped, %d)
+    PRINT_OBJ(ctx->AccessInfo.GvaValid, %d)
+
+    PRINT_OBJ(ctx->Gpa, %#08llx)
+    PRINT_OBJ(ctx->Gva, %#08llx)
+    fprintf(stderr, "\n");
+}
+
+static void log_memory_region(hwaddr addr, int len, bool is_write) {
+    MemoryRegion *mr;
+    hwaddr l;
+    hwaddr addr1;
+
+    rcu_read_lock();
+    l = len;
+    mr = address_space_translate(&address_space_memory, addr, &addr1, &l, is_write);
+    rcu_read_unlock();
+
+    fprintf(stderr, "MemoryRegion\n");
+    fprintf(stderr, "============\n");
+
+    PRINT_OBJ(mr->name, %s)
+    PRINT_OBJ(mr->romd_mode, %d)
+    PRINT_OBJ(mr->ram, %d)
+    PRINT_OBJ(mr->subpage, %d)
+    PRINT_OBJ(mr->rom_device, %d)
+    PRINT_OBJ(mr->flush_coalesced_mmio, %d)
+
+    if (mr->container)
+        PRINT_OBJ(mr->container->name, %s)
+    PRINT_OBJ(mr->align, %llu)
+    PRINT_OBJ(mr->terminates, %d)
+    PRINT_OBJ(mr->ram_device, %d)
+    PRINT_OBJ(mr->enabled, %d)
+
+    if (mr->alias)
+        PRINT_OBJ(mr->alias->name, %s)
+    PRINT_OBJ(mr->priority, %d)
+    fprintf(stderr, "\n");
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_MEMORY_ACCESS_CONTEXT *ctx)
 {
     HRESULT hr;
@@ -630,7 +690,13 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_MEMORY_ACCESS_CONTEXT *ctx)
     }
 
     if (!emu_status.EmulationSuccessful) {
-        error_report("WHPX: Failed to emulate MMIO access");
+        error_report("WHPX: Failed to emulate MMIO access with"
+                     " EmulatorReturnStatus: %u", emu_status.AsUINT32);
+        log_memory_access(ctx);
+        log_memory_region(vcpu->exit_ctx.MemoryAccess.Gpa, 1,
+                          vcpu->exit_ctx.MemoryAccess.AccessInfo.AccessType);
+        trace_cpu_print_stats();
+        abort();
         return -1;
     }
 
@@ -855,6 +921,10 @@ static int whpx_vcpu_run(CPUState *cpu)
     struct whpx_vcpu *vcpu = get_whpx_vcpu(cpu);
     int ret;
 
+    LONGLONG startTime, endTime, elapsedMicrosec;
+    LONGLONG counterFreq;
+    QueryPerformanceFrequency((LARGE_INTEGER*)&counterFreq);
+
     whpx_vcpu_process_async_events(cpu);
     if (cpu->halted) {
         cpu->exception_index = EXCP_HLT;
@@ -888,6 +958,8 @@ static int whpx_vcpu_run(CPUState *cpu)
         }
 
         whpx_vcpu_post_run(cpu);
+
+        QueryPerformanceCounter((LARGE_INTEGER*)&startTime);
 
         switch (vcpu->exit_ctx.ExitReason) {
         case WHvRunVpExitReasonMemoryAccess:
@@ -976,6 +1048,37 @@ static int whpx_vcpu_run(CPUState *cpu)
             qemu_system_guest_panicked(cpu_get_crash_info(cpu));
             qemu_mutex_unlock_iothread();
             break;
+        }
+
+        QueryPerformanceCounter((LARGE_INTEGER*)&endTime);
+        elapsedMicrosec = endTime - startTime;
+        elapsedMicrosec *= 1000000;
+        elapsedMicrosec /= counterFreq;
+        trace_cpu_push_event(cpu->cpu_index, vcpu->exit_ctx.ExitReason, elapsedMicrosec);
+
+        switch (vcpu->exit_ctx.ExitReason) {
+            case WHvRunVpExitReasonMemoryAccess:
+                trace_mmio_event(cpu->cpu_index,
+                                 vcpu->exit_ctx.MemoryAccess.Gpa,
+                                 cpu->last_access_size,
+                                 vcpu->exit_ctx.MemoryAccess.AccessInfo.AccessType,
+                                 elapsedMicrosec);
+                // qemu_mutex_lock_iothread();
+                // log_memory_access(&vcpu->exit_ctx.MemoryAccess);
+                // log_memory_region(vcpu->exit_ctx.MemoryAccess.Gpa, 1,
+                //                   vcpu->exit_ctx.MemoryAccess.AccessInfo.AccessType);
+                // qemu_mutex_unlock_iothread();
+                break;
+
+            case WHvRunVpExitReasonX64IoPortAccess:
+                trace_ioport_event(cpu->cpu_index,
+                                   vcpu->exit_ctx.IoPortAccess.PortNumber,
+                                   vcpu->exit_ctx.IoPortAccess.AccessInfo.AccessSize,
+                                   vcpu->exit_ctx.IoPortAccess.AccessInfo.IsWrite,
+                                   elapsedMicrosec);
+                break;
+            default:
+                break;
         }
 
     } while (!ret);
@@ -1275,6 +1378,11 @@ static void whpx_handle_interrupt(CPUState *cpu, int mask)
     }
 }
 
+static void whpx_exit_notifier(Notifier *n, void *data) {
+    fprintf(stderr, "WHPX exit notifier called.\n");
+    trace_cpu_print_stats();
+}
+
 /*
  * Partition support
  */
@@ -1287,6 +1395,7 @@ static int whpx_accel_init(MachineState *ms)
     WHV_CAPABILITY whpx_cap;
     UINT32 whpx_cap_size;
     WHV_PARTITION_PROPERTY prop;
+    Notifier *exit_notifier = g_malloc0(sizeof(Notifier));
 
     whpx = &whpx_global;
 
@@ -1307,6 +1416,10 @@ static int whpx_accel_init(MachineState *ms)
         ret = -EINVAL;
         goto error;
     }
+
+    trace_cpu_init(smp_cpus);
+    exit_notifier->notify = whpx_exit_notifier;
+    qemu_add_exit_notifier(exit_notifier);
 
     memset(&prop, 0, sizeof(WHV_PARTITION_PROPERTY));
     prop.ProcessorCount = smp_cpus;
