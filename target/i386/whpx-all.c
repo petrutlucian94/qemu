@@ -992,32 +992,271 @@ static int whpx_vcpu_run(CPUState *cpu)
             UINT64 rip, rax, rcx, rdx, rbx;
             UINT32 signature[3] = {0};
 
+            #define VIRT_FAMILY     0x6
+            #define VIRT_MODEL      0x1F
+            #define VIRT_STEPPING   0x1
+
+            static UINT32 cpu_features_1 =
+                    // pat is disabled!
+                    feat_fpu        |
+                    feat_vme        |
+                    feat_de         |
+                    feat_tsc        |
+                    feat_msr        |
+                    feat_pae        |
+                    feat_mce        |
+                    feat_cx8        |
+                    feat_apic       |
+                    feat_sep        |
+                    // feat_mtrr    | hax enables it, but the msr isn't handled properly
+                    //                so the guest ignores it.    
+                    feat_pge        |
+                    feat_mca        |
+                    feat_cmov       |
+                    feat_clfsh      |
+                    feat_mmx        |
+                    feat_fxsr       |
+                    feat_sse        |
+                    feat_sse2       |
+                    feat_ss         |
+                    feat_pse        |
+                    feat_htt;
+
+            static UINT32 cpu_features_2 =
+                    feat_sse3       |
+                    feat_ssse3      |
+                    feat_sse41      |
+                    feat_sse42      |
+                    feat_cmpxchg16b |
+                    feat_movbe      |
+                    feat_popcnt;
+
+            static UINT32 cpu_features_ext =
+                    // disabled in 6.2.1 feat_execute_disable |
+                    feat_syscall         |
+                    feat_em64t;
+
+            UINT32 hw_family;
+            UINT32 hw_model;
+            // uint8_t physical_address_size;
+            // uint8_t pw_reserved_bits_high_mask;
+
             rip = vcpu->exit_ctx.VpContext.Rip +
                   vcpu->exit_ctx.VpContext.InstructionLength;
-            switch (vcpu->exit_ctx.CpuidAccess.Rax) {
-            case 1:
-                rax = vcpu->exit_ctx.CpuidAccess.DefaultResultRax;
-                /* Advertise that we are running on a hypervisor */
-                rcx =
-                    vcpu->exit_ctx.CpuidAccess.DefaultResultRcx |
-                    CPUID_EXT_HYPERVISOR;
 
-                rdx = vcpu->exit_ctx.CpuidAccess.DefaultResultRdx;
-                rbx = vcpu->exit_ctx.CpuidAccess.DefaultResultRbx;
+            rax = vcpu->exit_ctx.CpuidAccess.DefaultResultRax;
+            rcx = vcpu->exit_ctx.CpuidAccess.DefaultResultRcx;
+            rdx = vcpu->exit_ctx.CpuidAccess.DefaultResultRdx;
+            rbx = vcpu->exit_ctx.CpuidAccess.DefaultResultRbx;
+
+            switch (vcpu->exit_ctx.CpuidAccess.Rax) {
+            case 0: {                       // Maximum Basic Information
+                rax = 0xa;
                 break;
-            case WHPX_CPUID_SIGNATURE:
+            }
+            case 1: {                       // Version Information and Features
+                /*
+                 * In order to avoid the initialization of unnecessary extended
+                 * features in the Kernel for emulator (such as the snbep
+                 * performance monitoring feature in Xeon E5 series system,
+                 * and the initialization of this feature crashes the emulator),
+                 * when the hardware family id is equal to 6 and hardware model id
+                 * is greater than 0x1f, we virtualize the returned rax to 0x106F1,
+                 * that is an old i7 system, so the emulator can still utilize the
+                 * enough extended features of the hardware, but doesn't crash.
+                 */
+                hw_family = ((rax >> 16) & 0xFF0) |
+                            ((rax >> 8) & 0xF);
+                hw_model = ((rax >> 12) & 0xF0) |
+                           ((rax >> 4) & 0xF);
+                if (hw_family == VIRT_FAMILY && hw_model > VIRT_MODEL) {
+                    rax = ((VIRT_FAMILY & 0xFF0) << 16) |
+                                  ((VIRT_FAMILY & 0xF) << 8) |
+                                  ((VIRT_MODEL & 0xF0) << 12) |
+                                  ((VIRT_MODEL & 0xF) << 4) |
+                                  (VIRT_STEPPING & 0xF);
+                }
+
+                /* Report all threads in one package XXXXX vapic currently, we
+                 * hardcode it to the maximal number of vcpus, but we should see
+                 * the code in QEMU to vapic initialization.
+                 */
+                rbx =
+                        // Bits 31..16 are hard-coded, with the original author's
+                        // reasoning given in the above comment. However, these
+                        // values are not suitable for SMP guests.
+                        // TODO: Use QEMU's values instead
+                        // rBx[31..24]: Initial APIC ID
+                        // rBx[23..16]: Maximum number of addressable IDs for
+                        //              logical processors in this physical package
+                        (0x01 << 16) |
+                        // rBx[15..8]: CLFLUSH line size
+                        // Report a 64-byte CLFLUSH line size as QEMU does
+                        (0x08 << 8) |
+                        // rBx[7..0]: Brand index
+                        // 0 indicates that brand identification is not supported
+                        // (see IA SDM Vol. 3A 3.2, Table 3-14)
+                        0x00;
+
+                // Report only the features specified, excluding any features not
+                // supported by the host CPU, but including "hypervisor", which is
+                // desirable for VMMs.
+                // TBD: This will need to be changed to emulate new features.
+                rcx = (cpu_features_2 & rcx) | feat_hypervisor;
+                rdx = cpu_features_1 & rdx;
+                break;
+            }
+            case 2: {                       // Cache and TLB Information
+                // These hard-coded values are questionable
+                // TODO: Use QEMU's values instead
+                rax = 0x03020101;
+                rbx = 0;
+                rcx = 0;
+                rdx = 0x0c040844;
+                break;
+            }
+            case 3:                         // Reserved
+            case 4: {                       // Deterministic Cache Parameters
+                // [31:26] cores per package - 1
+                rax = rbx = rcx = rdx = 0;
+                break;
+            }
+            case 5:                         // MONITOR/MWAIT
+                // Unsupported because feat_monitor is not set
+            case 6:                         // Thermal and Power Management
+                // Unsupported
+            case 7:                         // Structured Extended Feature Flags
+                // Unsupported
+                // Leaf 8 is undefined
+            case 9: {                       // Direct Cache Access Information
+                // Unsupported
+                rax = rbx = rcx = rdx = 0;
+                break;
+            }
+            case 0xa: {                     // Architectural Performance Monitoring
+                // struct cpu_pmu_info *pmu_info = &hax->apm_cpuid_0xa;
+                // rax = pmu_info->cpuid_rax;
+                // rbx = pmu_info->cpuid_rbx;
+                // rcx = 0;
+                // rdx = pmu_info->cpuid_rdx;
+                // break;
+
+                // we'll just use the host values.
+                break;
+            }
+            case 0x40000000: {              // Unimplemented by real Intel CPUs
+                // Most VMMs, including KVM, Xen, VMware and Hyper-V, use this
+                // unofficial CPUID leaf, in conjunction with the "hypervisor"
+                // feature flag (c.f. case 1 above), to identify themselves to the
+                // guest OS, in a similar manner to CPUID leaf 0 for the CPU vendor
+                // ID. HAXM should return its own VMM vendor ID, even though no
+                // guest OS recognizes it, because it may be running as a guest VMM
+                // on top of another VMM such as KVM or Hyper-V, in which case rBx,
+                // rCx and rDx represent the underlying VMM's vendor ID and should
+                // be overridden.
                 memcpy(signature, "WHPXWHPXWHPX", 12);
                 rax = vcpu->exit_ctx.CpuidAccess.DefaultResultRax;
                 rbx = signature[0];
                 rcx = signature[1];
                 rdx = signature[2];
-                break
-            default:
-                rax = vcpu->exit_ctx.CpuidAccess.DefaultResultRax;
-                rcx = vcpu->exit_ctx.CpuidAccess.DefaultResultRcx;
-                rdx = vcpu->exit_ctx.CpuidAccess.DefaultResultRdx;
-                rbx = vcpu->exit_ctx.CpuidAccess.DefaultResultRbx;
+                break;
             }
+            case 0x80000000: {              // Maximum Extended Information
+                rax = 0x80000008;
+                rbx = rcx = rdx = 0;
+                break;
+            }
+            case 0x80000001: {              // Extended Signature and Features
+                rax = rbx = rcx = 0;
+                // Report only the features specified but turn off any features
+                // this processor doesn't support.
+                rdx = cpu_features_ext & rdx;
+                break;
+            }
+            /*
+             * Hard-coded following three Processor Brand String functions
+             * (0x80000002, 0x80000003, and 0x80000004) to report "Virtual CPU" at
+             * the middle of the CPU info string in the Kernel to indicate that the
+             * system is virtualized to run the emulator.
+             */
+            case 0x80000002: {              // Processor Brand String - part 1
+                rax = 0x74726956;
+                rbx = 0x206c6175;
+                rcx = 0x20555043;
+                rdx = 0x00000000;
+                break;
+            }
+            case 0x80000003: {              // Processor Brand String - part 2
+                rax = 0x00000000;
+                rbx = 0x00000000;
+                rcx = 0x00000000;
+                rdx = 0x00000000;
+                break;
+            }
+            case 0x80000004: {              // Processor Brand String - part 3
+                rax = 0x00000000;
+                rbx = 0x00000000;
+                rcx = 0x00000000;
+                rdx = 0x00000000;
+                break;
+            }
+            case 0x80000005: {
+                rax = rbx = rcx = rdx = 0;
+                break;
+            }
+            case 0x80000006: {
+                rax = rbx = 0;
+                rcx = 0x04008040;
+                rdx = 0;
+                break;
+            }
+            case 0x80000007: {
+                rax = rbx = rcx = rdx = 0;
+                break;
+            }
+            case 0x80000008: {              // Virtual/Physical Address Size
+                // Bit mask to identify the reserved bits in paging structure high
+                // order address field
+                // physical_address_size = (uint8_t)rax & 0xff;
+                // pw_reserved_bits_high_mask =
+                //         ~((1 << (physical_address_size - 32)) - 1);
+
+                // rbx = rcx = rdx = 0;
+                // rax = pw_reserved_bits_high_mask;
+                // rax should be set to pw_reserved_bits_high_mask,
+                // probably by mistake, HAX isn't doing it.
+                break;
+            }
+        }
+
+
+            // switch (vcpu->exit_ctx.CpuidAccess.Rax) {
+            // case 0:
+            //     rax = 0xa;
+            //     break
+            // case 1:
+            //     rax = vcpu->exit_ctx.CpuidAccess.DefaultResultRax;
+            //     /* Advertise that we are running on a hypervisor */
+            //     rcx =
+            //         vcpu->exit_ctx.CpuidAccess.DefaultResultRcx |
+            //         CPUID_EXT_HYPERVISOR;
+
+            //     rdx = vcpu->exit_ctx.CpuidAccess.DefaultResultRdx;
+            //     rbx = vcpu->exit_ctx.CpuidAccess.DefaultResultRbx;
+            //     break;
+            // case WHPX_CPUID_SIGNATURE:
+            //     memcpy(signature, "WHPXWHPXWHPX", 12);
+            //     rax = vcpu->exit_ctx.CpuidAccess.DefaultResultRax;
+            //     rbx = signature[0];
+            //     rcx = signature[1];
+            //     rdx = signature[2];
+            //     break
+            // default:
+            //     rax = vcpu->exit_ctx.CpuidAccess.DefaultResultRax;
+            //     rcx = vcpu->exit_ctx.CpuidAccess.DefaultResultRcx;
+            //     rdx = vcpu->exit_ctx.CpuidAccess.DefaultResultRdx;
+            //     rbx = vcpu->exit_ctx.CpuidAccess.DefaultResultRbx;
+            // }
 
             reg_names[0] = WHvX64RegisterRip;
             reg_names[1] = WHvX64RegisterRax;
@@ -1458,8 +1697,12 @@ static int whpx_accel_init(MachineState *ms)
         ret = -EINVAL;
         goto error;
     }
+    UINT32 cpuidExitList[] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 9,
+        0xa, 0x40000000,
+        0x80000000, 0x80000001,0x80000002, 0x80000003, 0x80000004,
+        0x80000005, 0x80000006, 0x80000007, 0x80000008};
 
-    UINT32 cpuidExitList[] = {1, WHPX_CPUID_SIGNATURE};
     hr = WHvSetPartitionProperty(whpx->partition,
                                  WHvPartitionPropertyCodeCpuidExitList,
                                  cpuidExitList,
