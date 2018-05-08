@@ -29,6 +29,8 @@
 #include <WinHvPlatform.h>
 #include <WinHvEmulation.h>
 
+#define WHPX_CPUID_SIGNATURE 0x40000000
+
 struct whpx_state {
     uint64_t mem_quota;
     WHV_PARTITION_HANDLE partition;
@@ -1344,6 +1346,27 @@ static int whpx_accel_init(MachineState *ms)
 
     if (FAILED(hr)) {
         error_report("WHPX: Failed to set partition CpuidExitList hr=%08lx",
+                     hr);
+        ret = -EINVAL;
+        goto error;
+    }
+
+    UINT32 signature[3] = {0};
+    memcpy(signature, "Hv#1\0\0\0\0\0\0\0\0", 12);
+
+    WHV_X64_CPUID_RESULT cpuidResultList[1] = {0};
+    cpuidResultList[0].Function = WHPX_CPUID_SIGNATURE;
+    cpuidResultList[0].Eax = 0;
+    cpuidResultList[0].Ebx = signature[0];
+    cpuidResultList[0].Ecx = signature[1];
+    cpuidResultList[0].Edx = signature[2];
+    hr = WHvSetPartitionProperty(whpx->partition,
+                                 WHvPartitionPropertyCodeCpuidResultList,
+                                 cpuidResultList,
+                                 RTL_NUMBER_OF(cpuidResultList) *
+                                    sizeof(WHV_X64_CPUID_RESULT));
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to set partition CpuidResultList hr=%08lx",
                      hr);
         ret = -EINVAL;
         goto error;
