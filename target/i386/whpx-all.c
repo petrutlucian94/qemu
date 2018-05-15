@@ -229,6 +229,7 @@ static void whpx_set_registers(CPUState *cpu)
     struct whpx_register_set vcxt = {0};
     HRESULT hr;
     int idx = 0;
+    int idx_next;
     int i;
     int v86, r86;
 
@@ -241,9 +242,11 @@ static void whpx_set_registers(CPUState *cpu)
     vcpu->apic_base = cpu_get_apic_base(x86_cpu->apic_state);
 
     /* Indexes for first 16 registers match between HV and QEMU definitions */
-    for (idx = 0; idx < CPU_NB_REGS64; idx += 1) {
-        vcxt.values[idx].Reg64 = env->regs[idx];
+    idx_next = 16;
+    for (idx = 0; idx < CPU_NB_REGS; idx += 1) {
+        vcxt.values[idx].Reg64 = (uint64_t)env->regs[idx];
     }
+    idx = idx_next;
 
     /* Same goes for RIP and RFLAGS */
     assert(whpx_register_names[idx] == WHvX64RegisterRip);
@@ -290,10 +293,12 @@ static void whpx_set_registers(CPUState *cpu)
 
     /* 16 XMM registers */
     assert(whpx_register_names[idx] == WHvX64RegisterXmm0);
-    for (i = 0; i < 16; i += 1, idx += 1) {
+    idx_next = idx + 16;
+    for (i = 0; i < sizeof(env->xmm_regs) / sizeof(ZMMReg); i += 1, idx += 1) {
         vcxt.values[idx].Reg128.Low64 = env->xmm_regs[i].ZMM_Q(0);
         vcxt.values[idx].Reg128.High64 = env->xmm_regs[i].ZMM_Q(1);
     }
+    idx = idx_next;
 
     /* 8 FP registers */
     assert(whpx_register_names[idx] == WHvX64RegisterFpMmx0);
@@ -385,6 +390,7 @@ static void whpx_get_registers(CPUState *cpu)
     uint64_t tpr, apic_base;
     HRESULT hr;
     int idx = 0;
+    int idx_next;
     int i;
 
     assert(cpu_is_stopped(cpu) || qemu_cpu_is_self(cpu));
@@ -400,9 +406,11 @@ static void whpx_get_registers(CPUState *cpu)
     }
 
     /* Indexes for first 16 registers match between HV and QEMU definitions */
-    for (idx = 0; idx < CPU_NB_REGS64; idx += 1) {
+    idx_next = 16;
+    for (idx = 0; idx < CPU_NB_REGS; idx += 1) {
         env->regs[idx] = vcxt.values[idx].Reg64;
     }
+    idx = idx_next;
 
     /* Same goes for RIP and RFLAGS */
     assert(whpx_register_names[idx] == WHvX64RegisterRip);
@@ -449,10 +457,12 @@ static void whpx_get_registers(CPUState *cpu)
 
     /* 16 XMM registers */
     assert(whpx_register_names[idx] == WHvX64RegisterXmm0);
-    for (i = 0; i < 16; i += 1, idx += 1) {
+    idx_next = idx + 16;
+    for (i = 0; i < sizeof(env->xmm_regs) / sizeof(ZMMReg); i += 1, idx += 1) {
         env->xmm_regs[i].ZMM_Q(0) = vcxt.values[idx].Reg128.Low64;
         env->xmm_regs[i].ZMM_Q(1) = vcxt.values[idx].Reg128.High64;
     }
+    idx = idx_next;
 
     /* 8 FP registers */
     assert(whpx_register_names[idx] == WHvX64RegisterFpMmx0);
@@ -1203,7 +1213,7 @@ static void whpx_update_mapping(hwaddr start_pa, ram_addr_t size,
         error_report("WHPX: Failed to %s GPA range '%s' PA:%p, Size:%p bytes,"
                      " Host:%p, hr=%08lx",
                      (add ? "MAP" : "UNMAP"), name,
-                     (void *)start_pa, (void *)size, host_va, hr);
+                     (void *)(uintptr_t)start_pa, (void *)size, host_va, hr);
     }
 }
 
@@ -1234,8 +1244,8 @@ static void whpx_process_section(MemoryRegionSection *section, int add)
     host_va = (uintptr_t)memory_region_get_ram_ptr(mr)
             + section->offset_within_region + delta;
 
-    whpx_update_mapping(start_pa, size, (void *)host_va, add,
-                       memory_region_is_rom(mr), mr->name);
+    whpx_update_mapping(start_pa, size, (void *)(uintptr_t)host_va, add,
+                        memory_region_is_rom(mr), mr->name);
 }
 
 static void whpx_region_add(MemoryListener *listener,
