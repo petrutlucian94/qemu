@@ -1,6 +1,4 @@
-#include "windows.h"
 #include <stdbool.h>
-
 #include <WinHvPlatform.h>
 #include <WinHvEmulation.h>
 
@@ -24,7 +22,9 @@
   X(HRESULT, WHvCancelRunVirtualProcessor, (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, UINT32 Flags)) \
   X(HRESULT, WHvGetVirtualProcessorRegisters, (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, const WHV_REGISTER_NAME* RegisterNames, UINT32 RegisterCount, WHV_REGISTER_VALUE* RegisterValues)) \
   X(HRESULT, WHvSetVirtualProcessorRegisters, (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, const WHV_REGISTER_NAME* RegisterNames, UINT32 RegisterCount, const WHV_REGISTER_VALUE* RegisterValues)) \
-
+  X(HRESULT, WHvRequestInterrupt, (WHV_PARTITION_HANDLE Partition, WHV_INTERRUPT_CONTROL* Interrupt, UINT32 InterruptControlSize)) \
+  X(HRESULT, WHvGetVirtualProcessorInterruptControllerState, (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, PVOID State, UINT32 StateSize, UINT32 *WrittenSize)) \
+  X(HRESULT, WHvSetVirtualProcessorInterruptControllerState, (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, PVOID State, UINT32 StateSize)) \
 
 #define LIST_WINHVEMULATION_FUNCTIONS(X) \
   X(HRESULT, WHvEmulatorCreateEmulator, (const WHV_EMULATOR_CALLBACKS* Callbacks, WHV_EMULATOR_HANDLE* Emulator)) \
